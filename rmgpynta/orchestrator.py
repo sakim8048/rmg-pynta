@@ -1,0 +1,190 @@
+"""The RMGPynta orchestrator class: steps 1 through 8 + data provenance.
+
+See ``rmgpynta/__init__.py`` for why this class never imports ``pynta`` or
+``rmgpy`` directly -- every step that needs either one runs as a subprocess
+via :mod:`rmgpynta.subprocess_utils` against a standalone script in
+:mod:`rmgpynta.drivers`.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+from rmgpynta import libraries, provenance, reaction_schema, selection
+from rmgpynta.paths import RoundPaths, for_round
+from rmgpynta.subprocess_utils import run_in_env
+
+_DRIVERS_DIR = Path(__file__).parent / "drivers"
+_RUN_PYNTA_DRIVER = _DRIVERS_DIR / "run_pynta_job.py"
+_RUN_RMG_DRIVER = _DRIVERS_DIR / "run_rmg_job.py"
+
+
+@dataclass
+class RoundResult:
+    round_idx: int
+    n_core_reactions: int
+    n_edge_reactions: int
+    n_selected: int
+    library_name: str
+    provenance_summary: dict
+
+
+@dataclass
+class RMGPynta:
+    """Orchestrates one RMG<->Pynta feedback loop.
+
+    Parameters
+    ----------
+    work_dir:
+        Root directory; one ``round_NNN/`` subdirectory per iteration (see
+        :mod:`rmgpynta.paths`).
+    pynta_env_python, rmg_env_python:
+        Interpreter paths for the two conda environments, e.g.
+        ``~/.conda/envs/pynta_env/bin/python`` /
+        ``~/.conda/envs/rmg_env/bin/python``.
+    pynta_kwargs:
+        Keyword arguments forwarded essentially verbatim into
+        ``pynta.main.Pynta(...)`` every round (``metal``, ``surface_type``,
+        ``label`` is set automatically per round, ``launchpad_path``,
+        ``fworker_path``, ``queue_adapter_path``, ``repeats``, ``software``,
+        etc.) -- ``path`` and ``rxns_file`` are set automatically per round
+        and should not be included here. See the Pynta constructor's real
+        (long) signature before filling this in; there is no attempt here
+        to re-expose all ~40 of its parameters individually.
+    rmg_input_template:
+        Path to a base RMG ``input.py`` (``database(...)``,
+        ``catalystProperties(...)``, ``species(...)``, ``surfaceReactor(...)``,
+        ...) that already runs on its own for round 0. Each later round
+        clones it with that round's Pynta-derived libraries spliced into
+        ``thermoLibraries``/``reactionLibraries`` (see
+        :mod:`rmgpynta.libraries`).
+    rmg_database_path:
+        Local ``RMG-database`` checkout; round libraries get registered
+        under ``<rmg_database_path>/input/{thermo,kinetics}/libraries/``.
+    selection_strategy, selection_kwargs:
+        See :mod:`rmgpynta.selection`. Default ``"flux_threshold"`` --
+        ``"sensitivity"`` is deliberately not usable for this surface-
+        chemistry system (RMG-Py's ``surface_reactor`` raises
+        ``NotImplementedError`` for it; see ``selection.py``'s docstring).
+    max_rounds:
+        Upper bound on how many full loops (steps 2-8) to run.
+    min_new_reactions:
+        Stop early if a round's selection step (7) returns fewer than this
+        many reactions -- the design doc's suggested convergence signal.
+    allow_unverified_atom_labels:
+        Passed through to
+        ``rmgpynta.reaction_schema.write_pynta_reactions_yaml``. Defaults
+        to False: see ``reaction_schema.AtomLabelsNotVerified`` for why
+        this is a hard stop by default rather than a best-effort guess.
+    """
+
+    work_dir: Path
+    pynta_env_python: Path
+    rmg_env_python: Path
+    pynta_kwargs: dict
+    rmg_input_template: Path
+    rmg_database_path: Path
+    selection_strategy: "str | Callable" = "flux_threshold"
+    selection_kwargs: dict = field(default_factory=dict)
+    max_rounds: int = 5
+    min_new_reactions: int = 1
+    allow_unverified_atom_labels: bool = False
+
+    def __post_init__(self):
+        self.work_dir = Path(self.work_dir)
+
+    # ---- steps 2 / 8 ----------------------------------------------------
+    def build_reaction_yaml(self, records: list, rp: RoundPaths) -> Path:
+        return reaction_schema.write_pynta_reactions_yaml(
+            records, rp.reaction_yaml, allow_unverified_labels=self.allow_unverified_atom_labels
+        )
+
+    # ---- step 3 (+ corrected step 4) ------------------------------------
+    def run_pynta(self, rp: RoundPaths) -> None:
+        config = dict(self.pynta_kwargs)
+        config["path"] = str(rp.pynta_dir)
+        config["rxns_file"] = str(rp.reaction_yaml)
+        config.setdefault("label", f"rmgpynta_round_{rp.round_idx:03d}")
+        config_path = rp.pynta_dir / "_pynta_config.json"
+        config_path.write_text(json.dumps(config, indent=2))
+        run_in_env(self.pynta_env_python, _RUN_PYNTA_DRIVER, config_path)
+
+    # ---- step 5 -----------------------------------------------------------
+    def register_round_libraries(self, rp: RoundPaths) -> str:
+        thermo, kinetics_dir = libraries.collect_pynta_libraries(rp)
+        name = rp.library_name()
+        libraries.register_libraries(self.rmg_database_path, thermo, kinetics_dir, name)
+        libraries.archive_round_libraries(self.work_dir, rp, name)
+        return name
+
+    # ---- step 1 (once) / step 6 (every round) ------------------------------
+    def run_rmg(self, rp: RoundPaths, extra_thermo_libs: list, extra_kinetics_libs: list) -> None:
+        libraries.update_input_py_libraries(
+            self.rmg_input_template, rp.input_py, extra_thermo_libs, extra_kinetics_libs
+        )
+        run_in_env(self.rmg_env_python, _RUN_RMG_DRIVER, rp.input_py, rp.rmg_dir)
+
+    # ---- step 7 -------------------------------------------------------------
+    def select_round(self, rp: RoundPaths) -> list:
+        edge = json.loads(rp.edge_reactions_json.read_text())
+        selected = selection.select_important_reactions(
+            edge, strategy=self.selection_strategy, **self.selection_kwargs
+        )
+        rp.selected_edge_json.write_text(json.dumps(selected, indent=2))
+        return selected
+
+    # ---- data provenance (design doc §03) ------------------------------------
+    def log_provenance(self, rp: RoundPaths) -> dict:
+        chemkin_dir = rp.rmg_dir / "chemkin"
+        records = []
+        if chemkin_dir.exists():
+            for pattern in ("chem_annotated*.inp", "chem_edge_annotated*.inp"):
+                for path in sorted(chemkin_dir.glob(pattern)):
+                    records.extend(provenance.parse_annotated_chemkin(path))
+        provenance.write_provenance_log(records, rp.provenance_log)
+        return provenance.summarize(records)
+
+    # ---- orchestration: step 1 -> (2..8)* -> stop condition --------------------
+    def run_loop(self) -> list:
+        results: list = []
+
+        # Step 1, once: bootstrap the very first core from whatever
+        # libraries the template's own database(...) block already lists.
+        rp0 = for_round(self.work_dir, 0)
+        self.run_rmg(rp0, extra_thermo_libs=[], extra_kinetics_libs=[])
+        core = json.loads(rp0.core_reactions_json.read_text())
+
+        reactions_for_pynta = core
+        library_names: list = []
+
+        for round_idx in range(1, self.max_rounds + 1):
+            rp = for_round(self.work_dir, round_idx)
+
+            self.build_reaction_yaml(reactions_for_pynta, rp)  # steps 2 / 8
+            self.run_pynta(rp)  # step 3 (+ fixed step 4)
+            library_names.append(self.register_round_libraries(rp))  # step 5
+            self.run_rmg(rp, extra_thermo_libs=library_names, extra_kinetics_libs=library_names)  # step 6
+
+            core = json.loads(rp.core_reactions_json.read_text())
+            edge = json.loads(rp.edge_reactions_json.read_text())
+            prov_summary = self.log_provenance(rp)  # §03
+            selected = self.select_round(rp)  # step 7
+
+            results.append(
+                RoundResult(
+                    round_idx=round_idx,
+                    n_core_reactions=len(core),
+                    n_edge_reactions=len(edge),
+                    n_selected=len(selected),
+                    library_name=library_names[-1],
+                    provenance_summary=prov_summary,
+                )
+            )
+
+            if len(selected) < self.min_new_reactions:
+                break
+            reactions_for_pynta = selected
+
+        return results

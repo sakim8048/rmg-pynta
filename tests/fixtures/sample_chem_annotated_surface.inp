@@ -1,0 +1,61 @@
+ELEMENTS
+    H
+    C
+    N
+    X
+END
+
+SPECIES
+    H(8)
+    NH2(D)(9)
+    NH3(2)
+    H2(3)
+    CH4(1)
+    X(5)
+    CH4X(13)
+    XH(12)
+    XNH2(14)
+END
+
+REACTIONS    KCAL/MOLE MOLES
+
+! Reaction index: Chemkin #1; RMG #3
+! Template reaction: R_Recombination
+! Flux pairs: NH2(D)(9), NH3(2); H(8), NH3(2);
+! Estimated from node Root_1R->H_N-2R->S_N-2CHNO->H_N-2CNO-inRing in family R_Recombination.
+H(8)+NH2(D)(9)<=>NH3(2)                             6.358320e+13 0.035     0.000
+
+! Reaction index: Chemkin #2; RMG #4
+! Template reaction: R_Recombination
+! Flux pairs: H(8), H2(3); H(8), H2(3);
+! Matched reaction 56 H + H <=> H2 in R_Recombination/training
+! This reaction matched rate rule [Root_1R->H_N-2R->S_2CHNO->H]
+! family: R_Recombination
+H(8)+H(8)<=>H2(3)                                   5.450000e+10 0.000     1.500
+
+! Reaction index: Chemkin #3; RMG #7
+! Template reaction: Surface_Adsorption_vdW
+! Flux pairs: X(5), CH4X(13); CH4(1), CH4X(13);
+! Matched reaction 11 CH4 + X <=> CH4X in Surface_Adsorption_vdW/training
+! This reaction matched rate rule [Adsorbate;VacantSite]
+! family: Surface_Adsorption_vdW
+! metal: None
+X(5)+CH4(1)<=>CH4X(13)                              8.000e-03 0.000     0.000
+    STICK
+
+! Reaction index: Chemkin #4; RMG #9
+! Template reaction: Surface_Adsorption_Dissociative
+! Flux pairs: NH3(2), XNH2(14); X(5), XH(12); X(5), XH(12);
+! Average of [From training reaction 1 used for H2;VacantSite1;VacantSite2]
+! Estimated using template [Adsorbate;VacantSite1;VacantSite2] for rate rule [N;VacantSite1;VacantSite2]
+! Euclidian distance = 1.0
+! Multiplied by reaction path degeneracy 3.0
+! family: Surface_Adsorption_Dissociative
+X(5)+X(5)+NH3(2)<=>XH(12)+XNH2(14)                  4.500e-02 0.000     1.195
+    STICK
+
+! Reaction index: Chemkin #5; RMG #55
+! Library reaction: pt111_bootstrap_round_000
+X(5)+XH(12)<=>X(5)+XH(12)                           1.000e+13 0.000     0.000
+
+END
