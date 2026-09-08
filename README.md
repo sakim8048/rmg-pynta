@@ -122,6 +122,11 @@ compute on a malformed Pynta job or silently corrupting a mechanism:
   estimate (a confirmed, stable API for the latter was not available while
   writing this). Reasonable as a first cut; revisit if round-to-round
   selection looks off.
+- **`pynta_env` and `rmg_env` are kept separate on purpose.** A merged
+  environment was investigated and hits a real package collision
+  (`pysidt` vs `pysidt-rmg`, two different distributions installing to the
+  same import path) -- see [`docs/environment-merge-notes.md`](docs/environment-merge-notes.md)
+  before attempting it again.
 
 ## Round directory layout
 
