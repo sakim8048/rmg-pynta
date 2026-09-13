@@ -41,20 +41,20 @@ import each other either. Every step that needs one of them shells out to
 that environment's own interpreter running one of the `drivers/` scripts,
 which are standalone (stdlib + `pynta` or `rmgpy` only).
 
-## Install
+%## Install
 
-```bash
-pip install --cert ~/snl-ca.pem -e ".[test]"  # --cert needed on this machine: corporate TLS-interception proxy
-pytest
-```
+%```bash
+%pip install --cert ~/snl-ca.pem -e ".[test]"  # --cert needed on this machine: corporate TLS-interception proxy
+%pytest
+%```
 
-Tested against Python 3.13 (test run) and syntax-checked against 3.8 (the
-system `/usr/bin/python3`, and this repo's stated `requires-python`).
+%Tested against Python 3.13 (test run) and syntax-checked against 3.8 (the
+%system `/usr/bin/python3`, and this repo's stated `requires-python`).
 
-This installs `rmgpynta` for whichever Python runs the orchestrator loop
-itself (needs only `PyYAML`). Point `pynta_env_python` / `rmg_env_python`
-at your existing conda envs -- `rmgpynta` does not need to be installed
-inside either of them.
+%This installs `rmgpynta` for whichever Python runs the orchestrator loop
+%itself (needs only `PyYAML`). Point `pynta_env_python` / `rmg_env_python`
+%at your existing conda envs -- `rmgpynta` does not need to be installed
+%inside either of them.
 
 ## A real bug this project works around
 
