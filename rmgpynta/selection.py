@@ -1,30 +1,30 @@
 """Step 7: select which edge reactions are worth a Pynta DFT calculation.
 
-Real constraint confirmed against ``rmgpy/rmg/input.py`` on this machine:
-``surface_reactor(...)`` (what ``surfaceReactor(...)`` in an RMG ``input.py``
-maps to) explicitly does this on a ``sensitivity`` argument::
+Default strategy is a flux/rate-constant threshold over the edge
+(``select_by_rate_constant``). A real sensitivity x uncertainty strategy is
+also available (``strategy="sensitivity_uncertainty"``,
+``select_by_sensitivity_uncertainty`` below) -- despite ``rmgpy/rmg/input.py``
+hard-rejecting ``sensitivity=[...]`` for ``surfaceReactor(...)``::
 
     if sensitivity:
         raise NotImplementedError("Can't currently do sensitivity with surface reactors.")
 
-Every real RMG job for this project (see the ``rmg_ch4_pt111/input.py``
-referenced throughout the RMG-Pynta Feedback Loop artifact) uses
-``surfaceReactor(...)``, not ``simpleReactor(...)``/``liquidReactor(...)``
-(the two reactor types that do support ``sensitivity=[...]``). So RMG's
-built-in sensitivity analysis -- what the original design sketch assumed
-would be available -- cannot actually be used for this system. The default
-strategy here is a flux/rate-constant threshold over the edge instead.
+that restriction is specific to the ``input.py`` convenience wrapper, not to
+RMG-Py's solver: ``rmgpy.tools.uncertainty.Uncertainty.sensitivity_analysis()``
+constructs ``rmgpy.solver.SurfaceReactor`` directly and it supports
+sensitivity fine (confirmed against a real round-0 core from this project --
+see ``drivers/run_uncertainty_job.py``, which drives that class from rmg_env
+and needed one small upstream RMG-Py patch to get there).
 """
 from __future__ import annotations
 
+import json
 import math
+import re
+from pathlib import Path
 from typing import Callable, Iterable
 
 R_KJ_PER_MOL_K = 8.314462618e-3
-
-
-class SensitivityNotSupported(NotImplementedError):
-    pass
 
 
 def _rate_constant(record: dict, temperature_k: float) -> float | None:
@@ -80,6 +80,58 @@ def unrankable(edge_records: Iterable[dict]) -> list:
     return [r for r in edge_records if _rate_constant(r, 900.0) is None]
 
 
+def _normalize_reaction_string(reaction_string: str) -> str:
+    """Match ``drivers.run_uncertainty_job``'s normalization, so a ranking
+    JSON's chemkin-format strings ("X(5)+CH4(1)<=>CH4X(13)") line up with
+    this project's own plain-label ``reaction_string`` records
+    ("X + CH4 <=> CH4X"). Also tolerates already-normalized input (idempotent)
+    so records can be matched directly if ever needed.
+    """
+    lhs, rhs = reaction_string.split("<=>")
+
+    def side(s):
+        tokens = re.sub(r"\(\d+\)", "", s).split("+")
+        return " + ".join(token.strip() for token in tokens)
+
+    return f"{side(lhs)} <=> {side(rhs)}"
+
+
+def select_by_sensitivity_uncertainty(
+    records: Iterable[dict],
+    ranking_path: "str | Path",
+    top_n: int | None = 15,
+) -> list:
+    """Rank by RMG-Py's real sensitivity x uncertainty contribution to a
+    chosen observable species, using a ranking JSON that
+    ``drivers.run_uncertainty_job`` (run in rmg_env, since it needs
+    ``rmgpy.tools.uncertainty``) must already have produced for this round --
+    that driver isn't invoked from here, since this module stays pure Python
+    (see the package's own subprocess-boundary design in
+    ``rmgpynta/__init__.py``); see ``orchestrator.run_uncertainty_analysis``.
+
+    A record's ``reaction_string`` (plain species labels, e.g.
+    "X + CH4 <=> CH4X") is matched against the ranking's normalized chemkin
+    strings. RMG occasionally has more than one "duplicate" reaction (same
+    net stoichiometry, different reacting sites) sharing one
+    ``reaction_string`` -- confirmed ~1% of a real core -- so the first
+    matching record wins; both represent essentially the same TS-search job
+    for Pynta's purposes.
+    """
+    ranking = json.loads(Path(ranking_path).read_text())
+    by_string: dict = {}
+    for record in records:
+        by_string.setdefault(record["reaction_string"], record)
+
+    selected = []
+    for row in ranking:
+        record = by_string.get(_normalize_reaction_string(row["reaction_string"]))
+        if record is not None:
+            selected.append(record)
+        if top_n is not None and len(selected) >= top_n:
+            break
+    return selected
+
+
 def select_important_reactions(
     edge_records: Iterable[dict],
     strategy: str | Callable = "flux_threshold",
@@ -87,16 +139,8 @@ def select_important_reactions(
 ) -> list:
     if strategy == "flux_threshold":
         return select_by_rate_constant(edge_records, **kwargs)
-    if strategy == "sensitivity":
-        raise SensitivityNotSupported(
-            "RMG-Py's surface_reactor(...) raises NotImplementedError for "
-            "sensitivity=[...] (rmgpy/rmg/input.py, surface_reactor, the "
-            "'Can't currently do sensitivity with surface reactors' check) "
-            "-- sensitivity analysis only works with simpleReactor/"
-            "liquidReactor, neither of which represents this Pt "
-            "surface-chemistry system. Use strategy='flux_threshold' "
-            "(the default), or supply your own callable."
-        )
+    if strategy == "sensitivity_uncertainty":
+        return select_by_sensitivity_uncertainty(edge_records, **kwargs)
     if callable(strategy):
         return strategy(edge_records, **kwargs)
     raise ValueError(f"Unknown selection strategy: {strategy!r}")

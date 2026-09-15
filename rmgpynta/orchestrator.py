@@ -19,6 +19,7 @@ from rmgpynta.subprocess_utils import run_in_env
 _DRIVERS_DIR = Path(__file__).parent / "drivers"
 _RUN_PYNTA_DRIVER = _DRIVERS_DIR / "run_pynta_job.py"
 _RUN_RMG_DRIVER = _DRIVERS_DIR / "run_rmg_job.py"
+_RUN_UNCERTAINTY_DRIVER = _DRIVERS_DIR / "run_uncertainty_job.py"
 
 
 @dataclass
@@ -64,10 +65,13 @@ class RMGPynta:
         Local ``RMG-database`` checkout; round libraries get registered
         under ``<rmg_database_path>/input/{thermo,kinetics}/libraries/``.
     selection_strategy, selection_kwargs:
-        See :mod:`rmgpynta.selection`. Default ``"flux_threshold"`` --
-        ``"sensitivity"`` is deliberately not usable for this surface-
-        chemistry system (RMG-Py's ``surface_reactor`` raises
-        ``NotImplementedError`` for it; see ``selection.py``'s docstring).
+        See :mod:`rmgpynta.selection`. Default ``"flux_threshold"``.
+        ``"sensitivity_uncertainty"`` ranks by RMG-Py's real sensitivity x
+        uncertainty contribution instead (see ``selection.py``'s docstring
+        and ``run_uncertainty_analysis`` below) -- ``run_loop`` runs that
+        driver automatically before round 0's selection when this strategy
+        is set; ``selection_kwargs`` should not include ``ranking_path`` for
+        that case, since ``run_loop`` fills it in itself.
     max_rounds:
         Upper bound on how many full loops (steps 2-8) to run.
     min_new_reactions:
@@ -126,11 +130,65 @@ class RMGPynta:
         )
         run_in_env(self.rmg_env_python, _RUN_RMG_DRIVER, rp.input_py, rp.rmg_dir)
 
+    # ---- step 7 (sensitivity_uncertainty strategy only) ---------------------
+    def run_uncertainty_analysis(
+        self,
+        rp: RoundPaths,
+        edge: bool = False,
+        extra_thermo_libs: list | None = None,
+        extra_kinetics_libs: list | None = None,
+    ) -> Path:
+        """Runs drivers/run_uncertainty_job.py against this round's core (or
+        edge, for round >= 1's select_round) chemkin output, producing
+        sensitivity_uncertainty_ranking.json for
+        selection.select_by_sensitivity_uncertainty to read. Needs
+        rmgpy.tools.uncertainty, so it's a subprocess in rmg_env like run_rmg,
+        never imported here directly (see rmgpynta/__init__.py).
+
+        ``extra_thermo_libs``/``extra_kinetics_libs`` should be the same
+        round-tagged library names ``run_rmg`` was called with for this
+        round (``library_names`` in ``run_loop``) -- from round 1 onward the
+        model's thermo/kinetics partly comes from Pynta-derived libraries
+        registered in earlier rounds, and extract_sources_from_model() needs
+        those loaded to attribute sources correctly. species_edge_dictionary.txt
+        was confirmed to already include every core species too (not just
+        edge-exclusive ones), so it works as a drop-in dictionary here.
+        """
+        prefix = "chem_edge_annotated" if edge else "chem_annotated"
+        chemkin_dir = rp.rmg_dir / "chemkin"
+        dictionary_name = "species_edge_dictionary.txt" if edge else "species_dictionary.txt"
+        out_dir = rp.rmg_dir / ("uncertainty_edge" if edge else "uncertainty")
+
+        extra_libraries_json = None
+        if extra_thermo_libs or extra_kinetics_libs:
+            extra_libraries_json = out_dir / "_extra_libraries.json"
+            extra_libraries_json.parent.mkdir(parents=True, exist_ok=True)
+            extra_libraries_json.write_text(json.dumps({
+                "extra_thermo_libraries": extra_thermo_libs or [],
+                "extra_reaction_libraries": extra_kinetics_libs or [],
+            }))
+
+        args = [
+            chemkin_dir / f"{prefix}-gas.inp",
+            chemkin_dir / f"{prefix}-surface.inp",
+            chemkin_dir / dictionary_name,
+            out_dir,
+        ]
+        if extra_libraries_json is not None:
+            args.append(extra_libraries_json)
+        run_in_env(self.rmg_env_python, _RUN_UNCERTAINTY_DRIVER, *args)
+        return out_dir / "sensitivity_uncertainty_ranking.json"
+
     # ---- step 7 -------------------------------------------------------------
-    def select_round(self, rp: RoundPaths) -> list:
+    def select_round(self, rp: RoundPaths, library_names: list) -> list:
         edge = json.loads(rp.edge_reactions_json.read_text())
+        round_selection_kwargs = dict(self.selection_kwargs)
+        if self.selection_strategy == "sensitivity_uncertainty":
+            round_selection_kwargs["ranking_path"] = self.run_uncertainty_analysis(
+                rp, edge=True, extra_thermo_libs=library_names, extra_kinetics_libs=library_names
+            )
         selected = selection.select_important_reactions(
-            edge, strategy=self.selection_strategy, **self.selection_kwargs
+            edge, strategy=self.selection_strategy, **round_selection_kwargs
         )
         rp.selected_edge_json.write_text(json.dumps(selected, indent=2))
         return selected
@@ -156,7 +214,25 @@ class RMGPynta:
         self.run_rmg(rp0, extra_thermo_libs=[], extra_kinetics_libs=[])
         core = json.loads(rp0.core_reactions_json.read_text())
 
-        reactions_for_pynta = core
+        # Pynta's TS-search pipeline is built around adsorbed species and
+        # slab sites (see reaction_schema.is_surface_family's docstring) --
+        # a homogeneous gas-phase reaction (e.g. H_Abstraction between two
+        # gas species) has no surface site for it to build a TS structure
+        # from, so those are dropped before build_reaction_yaml ever sees them.
+        surface_core = [r for r in core if reaction_schema.is_surface_family(r["family"])]
+
+        # Every later round ranks its edge reactions through select_round()
+        # before handing them to Pynta (step 7) -- round 0's core never went
+        # through that step, so round 1 used to receive the entire surface
+        # core unranked (11,844 reactions in one real run). Apply the same
+        # ranking here so round 1 starts from a comparably small, prioritized
+        # set instead.
+        round0_selection_kwargs = dict(self.selection_kwargs)
+        if self.selection_strategy == "sensitivity_uncertainty":
+            round0_selection_kwargs["ranking_path"] = self.run_uncertainty_analysis(rp0)
+        reactions_for_pynta = selection.select_important_reactions(
+            surface_core, strategy=self.selection_strategy, **round0_selection_kwargs
+        )
         library_names: list = []
 
         for round_idx in range(1, self.max_rounds + 1):
@@ -170,7 +246,7 @@ class RMGPynta:
             core = json.loads(rp.core_reactions_json.read_text())
             edge = json.loads(rp.edge_reactions_json.read_text())
             prov_summary = self.log_provenance(rp)  # §03
-            selected = self.select_round(rp)  # step 7
+            selected = self.select_round(rp, library_names)  # step 7
 
             results.append(
                 RoundResult(
@@ -185,6 +261,6 @@ class RMGPynta:
 
             if len(selected) < self.min_new_reactions:
                 break
-            reactions_for_pynta = selected
+            reactions_for_pynta = [r for r in selected if reaction_schema.is_surface_family(r["family"])]
 
         return results

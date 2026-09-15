@@ -14,8 +14,10 @@ Reaction record schema (one dict per reaction, from the intermediate JSON)::
       "reaction_string": str,           # e.g. "X(5)+CH4(1)<=>CH4X(13)"
       "family": str,                    # RMG kinetics family, e.g. "Surface_Adsorption_Dissociative"
       "degeneracy": float,
-      "reactants": [{"label": str, "adjacency_list": str}, ...],
-      "products":  [{"label": str, "adjacency_list": str}, ...],
+      "reactants": [{"label": str, "adjacency_list": str}, ...],  # per-species, for the "reaction: X + Y => Z" string only
+      "products":  [{"label": str, "adjacency_list": str}, ...],  # ditto
+      "reactant_block": str,            # this side's full Pynta-format block -- see reaction_record_to_pynta_entry
+      "product_block": str,             # ditto
       "kinetics_comment": str,          # raw multi-line "! ..." comment block, for provenance
     }
 
@@ -52,36 +54,63 @@ from typing import Iterable
 
 import yaml
 
-# RMG kinetics-family -> Pynta reaction_family, confirmed only for the
-# families actually observed producing a matched Pynta job in this
-# conversation's prior artifacts (Pt(111)/Pt(557)/Pt(211) audits) and in
-# ~/pynta-production/*.yaml. RMG-Py's real kineticsFamilies list (from
-# ~/rmg-production/rmg_ch4_pt111/input.py) is much longer -- anything not in
-# this map is deliberately left unmapped rather than guessed, since a wrong
-# reaction_family can steer Pynta's TS-search strategy incorrectly.
+# RMG kinetics-family -> Pynta reaction_family. The first three entries were
+# confirmed against families actually observed producing a matched Pynta job
+# in this conversation's prior artifacts (Pt(111)/Pt(557)/Pt(211) audits) and
+# in ~/pynta-production/*.yaml.
+#
+# The rest were added after tracing every use of reaction_family/family_name
+# through ~/pynta/pynta/*.py: it is read in exactly two places
+# (transitionstate.py's generate_constraints_harmonic_parameters, where the
+# parameter is accepted but never referenced again, and postprocessing.py,
+# where only the literal string "Surface_Migration" changes behavior -- it
+# switches on a diffusion-specific validation path). Everywhere else it is
+# inert: stored in info.json and echoed into a human-readable comment. The
+# real TS-search strategy comes from structurally comparing reactant/product
+# bonds (get_broken_formed_bonds + the SubgraphIsomorphicDecisionTree), not
+# from this string. So for every family below (none of which is literally
+# "Surface_Migration"), passing the RMG family name straight through is safe
+# and matches how real runs under ~/pynta-production/*.yaml already recorded
+# them (e.g. "Surface_Abstraction_vdW" and "Surface_Adsorption_Dissociative"
+# appear verbatim as reaction_family values in files there).
 RMG_TO_PYNTA_FAMILY = {
     "Surface_Adsorption_Dissociative": "Dissociative Adsorption",
     "Surface_Dissociation": "Dissociation",
     "Surface_Abstraction": "Surface Abstraction",
+    "Surface_Adsorption_vdW": "Surface_Adsorption_vdW",
+    "Surface_Adsorption_Single": "Surface_Adsorption_Single",
+    "Surface_Adsorption_Double": "Surface_Adsorption_Double",
+    "Surface_Adsorption_Bidentate": "Surface_Adsorption_Bidentate",
+    "Surface_Abstraction_vdW": "Surface_Abstraction_vdW",
 }
 
 UNMAPPED_RMG_FAMILIES_SEEN_IN_INPUT_PY = (
     # From ~/rmg-production/rmg_ch4_pt111/input.py's kineticsFamilies list.
-    # Before enabling a round that selects reactions from these families,
-    # confirm with a Pynta maintainer (or by hand-checking a worked example)
-    # what reaction_family string, if any, Pynta expects for each.
-    "Surface_Adsorption_vdW",
-    "Surface_Adsorption_Single",
-    "Surface_Adsorption_Double",
-    "Surface_Adsorption_Bidentate",
-    "Surface_Abstraction_vdW",
+    # Still deliberately excluded from rmg_input_template.py -- both crashed
+    # RMG itself with "Could not process a species with no reactive
+    # structures" (see run.log.attempt1/2), independent of the Pynta-mapping
+    # question, so there's nothing to map yet.
     "Surface_Bidentate_Dissociation",
     "Surface_Dissociation_to_Bidentate",
     "Surface_Monodentate_to_Bidentate",
     "Surface_vdW_to_Bidentate",
     "Surface_EleyRideal_Addition_Multiple_Bond",
-    "default",
 )
+
+
+def is_surface_family(rmg_family: str) -> bool:
+    """Whether an RMG kinetics family involves the catalyst surface at all.
+
+    RMG's own family-set naming convention (see RMG-database's
+    input/kinetics/families/recommended.py: the ``surface`` and
+    ``surface_development`` sets) prefixes every heterogeneous family with
+    ``Surface_``; the gas-phase ``default`` set has none. Used to keep
+    homogeneous gas-phase reactions (``H_Abstraction``, ``R_Recombination``,
+    etc.) out of Pynta rounds -- Pynta's TS-search pipeline is built around
+    adsorbed species and slab sites, so a reaction with no surface site has
+    nothing for it to build a TS structure from.
+    """
+    return rmg_family.startswith("Surface_")
 
 
 class UnsupportedReactionFamily(ValueError):
@@ -108,25 +137,6 @@ class AtomLabelsNotVerified(ValueError):
     """
 
 
-def _adjacency_block(species: list) -> str:
-    """Join one side's per-species adjacency lists into one Pynta-style block.
-
-    Pynta's own reactant/product strings (see module docstring) are a single
-    ``multiplicity 1`` header followed by *all* atoms of every species on
-    that side, numbered continuously. This assumes the intermediate JSON's
-    ``adjacency_list`` for each species already carries correctly numbered,
-    ``*``-labeled atom lines with bond references resolved against that
-    continuous numbering -- that renumbering has to happen on the rmg_env
-    side (in ``drivers/run_rmg_job.py``), where the real RMG ``Reaction``
-    atom-mapping is available; it cannot be reconstructed from adjacency
-    lists alone on this side of the process boundary.
-    """
-    lines = ["multiplicity 1"]
-    for spc in species:
-        lines.append(spc["adjacency_list"].rstrip("\n"))
-    return "\n".join(lines) + "\n"
-
-
 def translate_family(rmg_family: str) -> str:
     try:
         return RMG_TO_PYNTA_FAMILY[rmg_family]
@@ -150,16 +160,14 @@ def reaction_record_to_pynta_entry(
             f"{record.get('family')!r}) has no verified *1..*4 atom labels; "
             f"see rmgpynta.reaction_schema.AtomLabelsNotVerified."
         )
-    reactants = record["reactants"]
-    products = record["products"]
-    lhs = " + ".join(s["label"] for s in reactants)
-    rhs = " + ".join(s["label"] for s in products)
+    lhs = " + ".join(s["label"] for s in record["reactants"])
+    rhs = " + ".join(s["label"] for s in record["products"])
     return {
         "index": index,
         "reaction": f"{lhs} => {rhs}",
         "reaction_family": translate_family(record["family"]),
-        "reactant": _adjacency_block(reactants),
-        "product": _adjacency_block(products),
+        "reactant": record["reactant_block"],
+        "product": record["product_block"],
     }
 
 
