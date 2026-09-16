@@ -13,7 +13,7 @@ Newest first.
 
 ### pynta
 
-Uncommitted as of this writing (branch `update_environment_preprocessing`). Found while debugging fizzled `MolecularTSEstimate` fireworks (17143–17155) in the `pynta-rmg-test` project.
+Commit [`593d2c52`](https://github.com/zadorlab/pynta/commit/593d2c52). Found while debugging fizzled `MolecularTSEstimate` fireworks (17143–17155) in the `pynta-rmg-test` project.
 
 - **`pynta/utils.py`, `get_occupied_sites`** — raised a bare `ValueError` whenever an adsorbate atom had no candidate site within reach (e.g. `sites` came back empty for a gas-phase-only TS branch). Now skips that atom instead, matching how an out-of-cutoff nearest site is already skipped just below — "no candidate site" isn't an error, just nothing to mark occupied.
 - **`pynta/geometricanalysis.py`, `generate_adsorbate_molecule`** — when computing `neighbor_sites` with `max_dist` set (every caller in the codebase passes `max_dist=np.inf` to mean "no distance filtering"), the code filtered candidate sites by proximity to `target_sites` (currently-occupied sites). If nothing was occupied yet (e.g. `get_unique_TS_structs`'s gas-phase-reactant branch, which builds the 2D graph on a bare slab *before* placing the adsorbate), `target_sites` was empty, so the loop appended nothing — `neighbor_sites` silently came back `[]` even under `max_dist=np.inf`. This broke an invariant already documented and relied on elsewhere (`pynta/utils.py`'s `_interaction_terms`: "admol was built with max_dist=inf, where generate_adsorbate_molecule keeps ninds=range(len(sites))"). Fixed by falling back to the full site list when there's no occupied site to anchor the distance filter.
