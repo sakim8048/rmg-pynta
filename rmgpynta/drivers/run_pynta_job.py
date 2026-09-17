@@ -35,6 +35,7 @@ ours or anyone else's category-scoped one -- can claim these fireworks.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -126,19 +127,43 @@ def main(config_path: str) -> None:
     if config.get("launchpad_path"):
         _tag_fireworks_with_category(job.launchpad, config["label"], FIREWORKS_CATEGORY)
 
-    if wants_launch:
-        job.launch()
+    # Pynta.launch() runs FireWorks' rapidfirequeue(..., nlaunches="infinite")
+    # (pynta/main.py), which polls and resubmits forever and never returns on
+    # its own -- confirmed the hard way on round_001, where a process that
+    # called job.launch() directly sat "N jobs in queue / sleeping 60s" for
+    # two days straight *after* the workflow had already reached FireWorks
+    # state COMPLETED, silently blocking wait_for_fireworks_completion() and
+    # write_rmg_libraries_fixed() below forever. Running it as its own
+    # subprocess (fresh Pynta object built from the same config, launch()
+    # only -- see --launch-only below) lets this process poll for real
+    # completion independently and kill the launcher once that happens,
+    # instead of inheriting its infinite loop.
+    launch_proc = None
+    try:
+        if wants_launch:
+            launch_proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--launch-only", config_path]
+            )
 
-    if wants_launch and config.get("launchpad_path"):
-        wait_for_fireworks_completion(
-            config["launchpad_path"], config["label"], **wait_kwargs
-        )
-    # If launch=False, the workflow was only added (and tagged) on the
-    # launchpad, not run -- this driver returns without waiting, matching
-    # Pynta's own execute(launch=False) semantics (queue management left to
-    # the caller, e.g. a separate `qlaunch rapidfire` on an HPC scheduler --
-    # which must itself be pointed at a category='rmgpynta_test' FWorker to
-    # actually pick these up, same as rmg_pynta_test_fworker.yaml).
+        if wants_launch and config.get("launchpad_path"):
+            wait_for_fireworks_completion(
+                config["launchpad_path"], config["label"], **wait_kwargs
+            )
+        # If launch=False, the workflow was only added (and tagged) on the
+        # launchpad, not run -- this driver returns without waiting, matching
+        # Pynta's own execute(launch=False) semantics (queue management left
+        # to the caller, e.g. a separate `qlaunch rapidfire` on an HPC
+        # scheduler -- which must itself be pointed at a
+        # category='rmgpynta_test' FWorker to actually pick these up, same as
+        # rmg_pynta_test_fworker.yaml).
+    finally:
+        if launch_proc is not None and launch_proc.poll() is None:
+            launch_proc.terminate()
+            try:
+                launch_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                launch_proc.kill()
+                launch_proc.wait()
 
     n_written = write_rmg_libraries_fixed(
         path=config["path"],
@@ -154,5 +179,22 @@ def main(config_path: str) -> None:
     )
 
 
+def _launch_only(config_path: str) -> None:
+    """Child-process entry point: build the same Pynta object from
+    ``config_path`` (just for self.launchpad/self.fworker/self.qadapter/
+    self.queue/self.njobs_queue -- execute() has already run in the parent)
+    and call launch(), which blocks in FireWorks' infinite rapidfire loop
+    until this subprocess is terminated by main() above.
+    """
+    config = json.loads(Path(config_path).read_text())
+    config.pop("_execute_kwargs", None)
+    config.pop("_wait_kwargs", None)
+    job = Pynta(**config)
+    job.launch()
+
+
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if len(sys.argv) >= 3 and sys.argv[1] == "--launch-only":
+        _launch_only(sys.argv[2])
+    else:
+        main(sys.argv[1])
