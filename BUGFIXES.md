@@ -9,6 +9,14 @@ a fix lands. Covers both repos:
 
 Newest first.
 
+## 2026-09-17
+
+### rmg-pynta
+
+Commit [`0f0b242`](https://github.com/sakim8048/rmg-pynta/commit/0f0b242) — found after `round_001`'s post-launch step sat blocked for two days straight in the `pynta-rmg-test` project.
+
+- **`run_pynta_job.py`** — `Pynta.launch()` (`pynta/main.py`) runs FireWorks' `rapidfirequeue(..., nlaunches="infinite")`, which polls and resubmits forever and never returns on its own. The driver called it inline, ahead of `wait_for_fireworks_completion()`/`write_rmg_libraries_fixed()`, so once a round's actual FireWorks work reached state `COMPLETED` there was nothing left to launch but the process kept blocking anyway — confirmed on `round_001`: its workflow (536/536 fireworks) had already reached `COMPLETED`, while the process just kept logging "N jobs in queue / sleeping 60 secs" forever, never reaching the library-update step. `round_001` itself had to be recovered by hand (kill the stuck process, rerun just the wait+postprocess tail against the already-completed workflow). Fixed going forward by running `launch()` in its own subprocess (`--launch-only` mode, same file) while the parent polls completion independently and kills the launcher once the workflow finishes, then runs the library update automatically.
+
 ## 2026-09-15
 
 ### pynta
