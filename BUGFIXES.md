@@ -9,6 +9,14 @@ a fix lands. Covers both repos:
 
 Newest first.
 
+## 2026-09-21
+
+### rmg-pynta
+
+Commit [`83cb7e0`](https://github.com/sakim8048/rmg-pynta/commit/83cb7e0) — found via a real round-1 RMG rerun using a Pynta-registered thermo library.
+
+- **`postprocess_fix.py`, `write_rmg_libraries_fixed`** — wrote Pynta's raw NASA fit text and facet string straight through into the generated thermo library, breaking downstream RMG loading two ways. First, Pynta fits with `Tmin=298.15 K`, but `rmgpy.thermo.nasa.NASA.to_thermo_data()` (called from `ThermoDatabase.correct_binding_energy` while loading the library) looks up H298/S298 at exactly 298 K — outside the segment's own bounds — raising `ValueError: No valid NASA polynomial at temperature 298 K`. Fixed by rewriting `Tmin=(298.15,'K')` to `Tmin=(298.0,'K')` in the generated species text, matching Pynta's own placeholder/zero-Cp species convention. Second, Pynta's `surface_type` (e.g. `"fcc111"`) includes the crystal-structure prefix, but RMG's surface binding-energy database (`RMG-database/input/surface/libraries/metal.py`) keys facets by Miller index only (e.g. `"Pt111"`); `ThermoDatabase.get_thermo_data`'s scaling lookup builds `db_label = entry.metal + entry.facet`, so the raw value produced `"Ptfcc111"` and `DatabaseError: Metal 'Ptfcc' not found in database`. Fixed by stripping the known crystal-structure prefixes (`fcc`, `bcc`, `hcp`, `sc`, `diamond`, `rocksalt`, `hexagonal`) before writing the library header's facet field.
+
 ## 2026-09-17
 
 ### rmg-pynta
