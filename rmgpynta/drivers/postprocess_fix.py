@@ -28,9 +28,29 @@ proposed to zadorlab/pynta directly, separately from this project.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 
 from pynta.postprocessing import postprocess
+
+# Real, confirmed bug in pynta/postprocessing.py: SurfaceConfiguration /
+# GasConfiguration fit their NASA polynomial with wh.to_nasa(Tmin=298.15,
+# ...), which literally renders as "Tmin=(298.15,'K')" (twice -- once on
+# the first NASAPolynomial segment, once on the outer NASA object) in
+# rmg_species_text. But rmgpy.thermo.nasa.NASA.to_thermo_data() (called
+# from ThermoDatabase.correct_binding_energy while loading a library's
+# training rules) hardcodes H298/S298 lookups at exactly 298 K, not
+# 298.15 K -- 298 < 298.15 falls outside the segment's own bounds, so
+# NASA.select_polynomial raises "ValueError: No valid NASA polynomial at
+# temperature 298 K." Confirmed against a real round-1 RMG rerun using a
+# Pynta-registered thermo library. Pynta's own placeholder/zero-Cp species
+# template (same file) already writes "Tmin = (298.0, 'K')" for exactly
+# this reason, so 298.0 is the convention to match, not 298.15.
+_NASA_TMIN_298_15_RE = re.compile(r"Tmin=\(298\.15,'K'\)")
+
+
+def _fix_nasa_tmin(rmg_species_text: str) -> str:
+    return _NASA_TMIN_298_15_RE.sub("Tmin=(298.0,'K')", rmg_species_text)
 
 
 def _lowest_energy(spc):
@@ -51,6 +71,32 @@ def _lowest_energy(spc):
             return None
         return min(valid, key=lambda v: v.energy)
     return spc
+
+
+_CRYSTAL_STRUCTURE_PREFIXES = ("fcc", "bcc", "hcp", "sc", "diamond", "rocksalt", "hexagonal")
+
+
+def _rmg_facet(surface_type: str) -> str:
+    """Translate Pynta's ``surface_type`` (e.g. ``"fcc111"``, ``"bcc110"``,
+    ``"hcp0001"`` -- crystal structure + Miller index) into the facet label
+    RMG's own surface binding-energy database actually uses.
+
+    Real, confirmed bug: RMG-database/input/surface/libraries/metal.py keys
+    its entries as ``metal + Miller index`` only (``"Pt111"``, ``"Pt211"``,
+    ...), never with the crystal-structure prefix. ``ThermoDatabase.
+    get_thermo_data`` builds its scaling lookup as ``db_label = entry.metal
+    + entry.facet`` (rmgpy/data/thermo.py) from whatever this module writes
+    into a library entry's ``metal``/``facet`` comment fields -- passing
+    Pynta's raw ``surface_type`` straight through as ``facet`` produced
+    ``db_label = "Pt" + "fcc111" = "Ptfcc111"``, which RMG's surface.py
+    raises ``DatabaseError: Metal 'Ptfcc' not found in database`` on.
+    Confirmed against a real round-1 RMG rerun using a Pynta-registered
+    thermo library (metal="Pt", surface_type="fcc111").
+    """
+    for prefix in _CRYSTAL_STRUCTURE_PREFIXES:
+        if surface_type.startswith(prefix):
+            return surface_type[len(prefix):]
+    return surface_type
 
 
 def _lowest_barrier(kinetics):
@@ -93,8 +139,8 @@ def write_rmg_libraries_fixed(path, metal, facet, repeats, sites, site_adjacency
         if minspc is None:
             continue
         if thermo_text == "":
-            thermo_text += minspc.create_RMG_header("thermo_library", "", "", metal, facet)
-        thermo_text += minspc.rmg_species_text.replace("{index}", str(index))
+            thermo_text += minspc.create_RMG_header("thermo_library", "", "", metal, _rmg_facet(facet))
+        thermo_text += _fix_nasa_tmin(minspc.rmg_species_text.replace("{index}", str(index)))
         index += 1
         thermo_text += "\n"
     with open(os.path.join(path, "thermo_library.py"), "w") as f:
